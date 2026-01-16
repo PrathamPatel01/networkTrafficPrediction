@@ -1,14 +1,14 @@
-import pandas as pd
 import numpy as np
+import pandas as pd
 from sklearn.preprocessing import MinMaxScaler, LabelEncoder
 
-WINDOW = 30
+WINDOW = 50
 LEAD = 5
 
-def preprocess():
+def preprocess(input_csv="data/cleaned_data.csv", output_npz="data/dataset.npz"):
     print("🔄 Preprocessing...")
 
-    df = pd.read_csv("data/cleaned_data.csv")
+    df = pd.read_csv(input_csv)
 
     # Encode protocol
     le = LabelEncoder()
@@ -30,11 +30,12 @@ def preprocess():
     df[target] = scaler_y.fit_transform(df[[target]])
 
     # Add lag features
-    df["Lag_1"] = df[target].shift(1)
-    df["Lag_5"] = df[target].shift(5)
+    max_lag = 5
+    for lag in range(1, max_lag+1):
+        df[f"Lag_{lag}"] = df[target].shift(lag)
+        features.append(f"Lag_{lag}")
 
     df = df.dropna().reset_index(drop=True)
-    features += ["Lag_1", "Lag_5"]
 
     # Create sequences
     X, y = [], []
@@ -52,14 +53,16 @@ def preprocess():
     y_train, y_test = y[:split], y[split:]
 
     np.savez(
-        "data/dataset.npz",
+        output_npz,
         X_train=X_train,
         X_test=X_test,
         y_train=y_train,
-        y_test=y_test
+        y_test=y_test,
+        scaler_y=scaler_y
     )
 
     print(f"✅ Train: {X_train.shape}, Test: {X_test.shape}")
 
-if __name__ == "__main__":
-    preprocess()
+
+if __name__ == "__main__": preprocess()
+

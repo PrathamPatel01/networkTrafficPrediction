@@ -158,6 +158,7 @@ plt.ylabel("Normalized Traffic")
 plt.legend()
 plt.grid(alpha=0.3)
 plt.tight_layout()
+plt.savefig('baseline_result.png', dpi=100)
 plt.show()
 
 print("\n🔮 Forecast (next 5 seconds, scaled):")
