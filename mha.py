@@ -1,4 +1,8 @@
-# # train_enhanced_attention.py
+# train_baseline_plus_mha_warmstart.py
+# ✅ Baseline + Multi-Head Self-Attention (warm-start from .keras baseline checkpoint)
+# ✅ Normal training: load baseline -> add MHA -> train -> evaluate -> forecast -> plot
+# ✅ Includes MHA attention logs (recent-mass, lookback, top key steps, gate stats)
+
 import os, random
 import numpy as np
 import tensorflow as tf
@@ -9,47 +13,56 @@ from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 # CONFIG
 # -----------------------------
 BASELINE_CKPT = "best_baseline.keras"
-OUT_CKPT = "best_enhanced_attention.keras"
-PLOT_FILE = "enhanced_attention_result.png"
+OUT_CKPT      = "best_baseline_mha_warmstart.keras"
+PLOT_FILE     = "baseline_mha_warmstart.png"
 
-# Hyperparameters
 FORECAST_HORIZON = 20
-EPOCHS_PHASE1 = 30
-EPOCHS_PHASE2 = 100
+CLIP_RANGE = (0.0, 1.0)
+
+# Training
+EPOCHS_PHASE1 = 25
+EPOCHS_PHASE2 = 80
 BATCH_SIZE = 32
-LR_PHASE1 = 1e-3
+
+# Safer phase-1 LR (prevents loss explosions you saw)
+LR_PHASE1 = 3e-4
 LR_PHASE2 = 2e-4
 
-# Multi-head attention config
+# MHA config
 N_HEADS = 4
 KEY_DIM = 16
-DROPOUT_RATE = 0.1
+ATTN_DROPOUT = 0.1
+
+# Attention log settings (time interpretation)
+FREQ_MS     = 250.0
+POOL_FACTOR = 2  # MaxPooling1D(2) halves time => 1 step ~= 0.5s
 
 # -----------------------------
 # Reproducibility
 # -----------------------------
 os.environ["TF_DETERMINISTIC_OPS"] = "1"
-os.environ["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
 random.seed(42)
 np.random.seed(42)
 tf.random.set_seed(42)
 
 print("=" * 90)
-print("🚀 ENHANCED ATTENTION: Multi-Head + Skip Connections | MSE")
+print("🚀 BASELINE + MHA (warm-start + gated residual) | MSE")
 print("=" * 90)
 
+# -----------------------------
 # Load data
+# -----------------------------
 data = np.load("data/dataset.npz", allow_pickle=True)
 X_train, y_train = data["X_train"], data["y_train"]
-X_val, y_val = data["X_val"], data["y_val"]
-X_test, y_test = data["X_test"], data["y_test"]
-feature_names = data["feature_names"].tolist()
+X_val, y_val     = data["X_val"], data["y_val"]
+X_test, y_test   = data["X_test"], data["y_test"]
+feature_names    = data["feature_names"].tolist()
 
 WINDOW = X_train.shape[1]
 N_FEATURES = X_train.shape[2]
 
-# For inverse transform
-y_scale = float(data["y_scale"][0])
+# For inverse transform (scaled -> log1p(bytes))
+y_scale  = float(data["y_scale"][0])
 y_offset = float(data["y_offset"][0])
 
 def inverse_minmax(y_scaled):
@@ -62,195 +75,252 @@ print(f"Train: {X_train.shape}  Val: {X_val.shape}  Test: {X_test.shape}")
 print(f"WINDOW={WINDOW}, N_FEATURES={N_FEATURES}")
 
 # -----------------------------
-# Enhanced Model with Multi-Head Attention
+# Indices for forecasting updates
 # -----------------------------
-def build_enhanced_attention_model(window, n_features, n_heads=4, key_dim=16):
-    inputs = tf.keras.Input(shape=(window, n_features), name="input")
-    
-    # 1. Initial convolution with batch normalization
-    x = tf.keras.layers.Conv1D(128, 7, padding="same", name="conv1")(inputs)
-    x = tf.keras.layers.BatchNormalization()(x)
-    x = tf.keras.layers.Activation("relu")(x)
-    x = tf.keras.layers.Dropout(0.2)(x)
-    
-    x = tf.keras.layers.Conv1D(64, 5, padding="same", name="conv2")(x)
-    x = tf.keras.layers.BatchNormalization()(x)
-    x = tf.keras.layers.Activation("relu")(x)
-    x = tf.keras.layers.MaxPooling1D(2)(x)
-    x = tf.keras.layers.Dropout(0.25)(x)
-    
-    # 2. Bidirectional LSTM for sequence encoding
-    lstm_out = tf.keras.layers.Bidirectional(
-        tf.keras.layers.LSTM(64, return_sequences=True, dropout=0.2),
-        name="bilstm"
-    )(x)
-    
-    # 3. Layer normalization before attention
-    lstm_norm = tf.keras.layers.LayerNormalization(name="pre_attention_norm")(lstm_out)
-    
-    # 4. Multi-Head Attention
-    attention_output = tf.keras.layers.MultiHeadAttention(
-        num_heads=n_heads,
-        key_dim=key_dim,
-        dropout=DROPOUT_RATE,
-        name="multi_head_attention"
-    )(lstm_norm, lstm_norm)
-    
-    # 5. Skip connection (residual) with attention
-    attention_residual = tf.keras.layers.Add(name="attention_skip")([lstm_norm, attention_output])
-    attention_residual = tf.keras.layers.LayerNormalization(name="post_attention_norm")(attention_residual)
-    
-    # 6. Global context pooling (alternative to LSTM pooling)
-    avg_pool = tf.keras.layers.GlobalAveragePooling1D(name="global_avg_pool")(attention_residual)
-    max_pool = tf.keras.layers.GlobalMaxPooling1D(name="global_max_pool")(attention_residual)
-    context = tf.keras.layers.Concatenate(name="context_concat")([avg_pool, max_pool])
-    
-    # 7. TimeDistributed attention on LSTM outputs for fine-grained context
-    lstm_for_attention = tf.keras.layers.LSTM(32, return_sequences=True, dropout=0.1)(attention_residual)
-    
-    # Attention weights calculation
-    attention_weights = tf.keras.layers.Dense(1, activation="tanh", name="time_attention_dense")(lstm_for_attention)
-    attention_weights = tf.keras.layers.Flatten(name="attention_flatten")(attention_weights)
-    attention_weights = tf.keras.layers.Activation("softmax", name="time_attention_weights")(attention_weights)
-    
-    # Apply attention
-    attention_weights_expanded = tf.keras.layers.RepeatVector(32)(attention_weights)
-    attention_weights_expanded = tf.keras.layers.Permute([2, 1])(attention_weights_expanded)
-    weighted_lstm = tf.keras.layers.Multiply(name="apply_time_attention")([lstm_for_attention, attention_weights_expanded])
-    temporal_context = tf.keras.layers.GlobalAveragePooling1D(name="temporal_context")(weighted_lstm)
-    
-    # 8. Combine all contexts
-    combined = tf.keras.layers.Concatenate(name="final_concat")([context, temporal_context])
-    
-    # 9. Dense layers with skip connections
-    dense1 = tf.keras.layers.Dense(128, activation="relu", name="dense1")(combined)
-    dense1 = tf.keras.layers.BatchNormalization()(dense1)
-    dense1 = tf.keras.layers.Dropout(0.3)(dense1)
-    
-    dense2 = tf.keras.layers.Dense(64, activation="relu", name="dense2")(dense1)
-    dense2 = tf.keras.layers.BatchNormalization()(dense2)
-    dense2 = tf.keras.layers.Dropout(0.25)(dense2)
-    
-    # Skip connection in dense layers
-    dense_skip = tf.keras.layers.Dense(64, activation="linear")(combined)
-    dense2 = tf.keras.layers.Add()([dense2, dense_skip])
-    dense2 = tf.keras.layers.Activation("relu")(dense2)
-    
-    outputs = tf.keras.layers.Dense(1, name="output")(dense2)
-    
-    return tf.keras.Model(inputs, outputs, name="enhanced_attention_model")
+name_to_idx = {n: i for i, n in enumerate(feature_names)}
+target_idx = name_to_idx.get("Target", None)
+
+lag_idxs = []
+k = 1
+while f"Lag_{k}" in name_to_idx:
+    lag_idxs.append(name_to_idx[f"Lag_{k}"])
+    k += 1
+
+print(f"Target idx: {target_idx}")
+print(f"Lag idxs  : {lag_idxs} (count={len(lag_idxs)})")
 
 # -----------------------------
-# Build and Load Baseline Weights
+# Baseline builder (must match your baseline EXACTLY)
 # -----------------------------
-# First load baseline to get its structure
+def build_baseline(window, n_features):
+    inp = tf.keras.Input(shape=(window, n_features), name="inp")
+
+    x = tf.keras.layers.Conv1D(64, 5, padding="same", activation="relu", name="conv1")(inp)
+    x = tf.keras.layers.Conv1D(64, 3, padding="same", activation="relu", name="conv2")(x)
+    x = tf.keras.layers.MaxPooling1D(2, name="pool")(x)
+    x = tf.keras.layers.Dropout(0.25, name="drop_cnn")(x)
+
+    x = tf.keras.layers.LSTM(64, return_sequences=True, dropout=0.2, name="lstm1")(x)
+    x = tf.keras.layers.LSTM(32, dropout=0.1, name="lstm2")(x)
+
+    x = tf.keras.layers.Dense(64, activation="relu", name="dense1")(x)
+    x = tf.keras.layers.Dropout(0.25, name="drop_dense")(x)
+    x = tf.keras.layers.Dense(32, activation="relu", name="dense2")(x)
+    out = tf.keras.layers.Dense(1, name="out")(x)
+
+    return tf.keras.Model(inp, out, name="baseline")
+
+# -----------------------------
+# Baseline + MHA (gated residual correction)
+# -----------------------------
+def build_baseline_plus_mha(window, n_features):
+    inp = tf.keras.Input(shape=(window, n_features), name="inp")
+
+    # Same CNN backbone
+    x = tf.keras.layers.Conv1D(64, 5, padding="same", activation="relu", name="conv1")(inp)
+    x = tf.keras.layers.Conv1D(64, 3, padding="same", activation="relu", name="conv2")(x)
+    x = tf.keras.layers.MaxPooling1D(2, name="pool")(x)
+    x = tf.keras.layers.Dropout(0.25, name="drop_cnn")(x)
+
+    # LSTM1 sequence (T shrinks after pool)
+    seq = tf.keras.layers.LSTM(64, return_sequences=True, dropout=0.2, name="lstm1")(x)
+
+    # MHA over time (self-attention)
+    seq_norm = tf.keras.layers.LayerNormalization(name="attn_ln")(seq)
+
+    mha_layer = tf.keras.layers.MultiHeadAttention(
+        num_heads=N_HEADS,
+        key_dim=KEY_DIM,
+        dropout=ATTN_DROPOUT,
+        name="mha"
+    )
+    attn_out = mha_layer(seq_norm, seq_norm)
+
+    # Residual + norm
+    attn_res = tf.keras.layers.Add(name="attn_residual")([seq_norm, attn_out])
+    attn_res = tf.keras.layers.LayerNormalization(name="attn_post_ln")(attn_res)
+
+    # Summarize attention output to a vector
+    ctx64 = tf.keras.layers.GlobalAveragePooling1D(name="attn_pool")(attn_res)  # (B,64)
+
+    # Baseline summarizer (keep it)
+    last32 = tf.keras.layers.LSTM(32, dropout=0.1, name="lstm2")(seq)  # (B,32)
+
+    # Project ctx to 32
+    ctx32 = tf.keras.layers.Dense(32, activation="linear", name="ctx_proj")(ctx64)
+
+    # Gate (start small)
+    gate_inp = tf.keras.layers.Concatenate(name="gate_concat")([last32, ctx32])
+    gate = tf.keras.layers.Dense(
+        1, activation="sigmoid",
+        bias_initializer=tf.keras.initializers.Constant(-2.0),
+        name="gate"
+    )(gate_inp)
+
+    gated_ctx = tf.keras.layers.Multiply(name="gated_ctx")([ctx32, gate])
+    fused = tf.keras.layers.Add(name="fused_last_plus_mha")([last32, gated_ctx])
+
+    # Same dense head as baseline
+    x = tf.keras.layers.Dense(64, activation="relu", name="dense1")(fused)
+    x = tf.keras.layers.Dropout(0.25, name="drop_dense")(x)
+    x = tf.keras.layers.Dense(32, activation="relu", name="dense2")(x)
+    out = tf.keras.layers.Dense(1, name="out")(x)
+
+    return tf.keras.Model(inp, out, name="baseline_plus_mha")
+
+# -----------------------------
+# MHA Attention logging (like your additive logs)
+# -----------------------------
+def build_mha_probe(model: tf.keras.Model) -> tf.keras.Model:
+    """
+    Probe returns:
+      scores: (B, heads, T, T) from the MHA layer (avg later)
+      gate  : (B,1)
+    """
+    seq_norm = model.get_layer("attn_ln").output
+    mha = model.get_layer("mha")
+    gate = model.get_layer("gate").output
+
+    _, scores = mha(seq_norm, seq_norm, return_attention_scores=True)  # (B, heads, T, T)
+    return tf.keras.Model(model.input, [scores, gate], name="mha_probe")
+
+def log_mha_attention(model: tf.keras.Model, X_probe, freq_ms=250.0, pool_factor=2):
+    probe = build_mha_probe(model)
+    scores, gate = probe(X_probe, training=False)
+    scores = scores.numpy().astype(np.float64)          # (B, heads, T, T)
+    gate = gate.numpy().ravel().astype(np.float64)      # (B,)
+
+    # Average across batch and heads -> (T, T)
+    S = scores.mean(axis=(0, 1))
+
+    # Key importance distribution: average across queries -> (T,)
+    key_imp = S.mean(axis=0)
+    T = key_imp.shape[0]
+
+    step_s = (freq_ms / 1000.0) * pool_factor
+    span_s = (T - 1) * step_s
+
+    def share_last(seconds):
+        k = int(np.ceil(seconds / step_s))
+        k = max(1, min(k, T))
+        return float(key_imp[-k:].sum())
+
+    share_5  = share_last(5.0)
+    share_10 = share_last(10.0)
+    share_15 = share_last(15.0)
+
+    idx = np.arange(T, dtype=np.float64)
+    com = float((key_imp * idx).sum() / (key_imp.sum() + 1e-12))  # 0=oldest
+    lookback_s = float(span_s - com * step_s)
+
+    top_steps = np.argsort(key_imp)[-5:][::-1].tolist()
+    top_steps_sec_before = [float(span_s - s * step_s) for s in top_steps]
+
+    print("\n[MHA ATTN QUICK LOG]")
+    print(f"T={T} steps | step≈{step_s:.2f}s | span≈{span_s:.1f}s")
+    print(f"Attention mass last  5s: {share_5:.3f}")
+    print(f"Attention mass last 10s: {share_10:.3f}")
+    print(f"Attention mass last 15s: {share_15:.3f}")
+    print(f"Lookback (center-of-mass): {lookback_s:.2f}s before prediction")
+    print(f"Top-5 key steps (idx): {top_steps}")
+    print(f"Top-5 sec-before-pred: {[round(x,2) for x in top_steps_sec_before]}")
+    print(f"Gate mean={float(gate.mean()):.3f} (p90={float(np.quantile(gate,0.9)):.3f})\n")
+
+# -----------------------------
+# Build models
+# -----------------------------
+baseline_arch = build_baseline(WINDOW, N_FEATURES)
+mha_model = build_baseline_plus_mha(WINDOW, N_FEATURES)
+
+# -----------------------------
+# Warm-start from baseline checkpoint (.keras) and copy weights
+# -----------------------------
 baseline_loaded = tf.keras.models.load_model(BASELINE_CKPT, compile=False)
+print(f"✅ Loaded baseline model from {BASELINE_CKPT}")
 
-# Build enhanced model
-model = build_enhanced_attention_model(WINDOW, N_FEATURES, N_HEADS, KEY_DIM)
+loaded_map = {layer.name: layer for layer in baseline_loaded.layers}
 
-# Try to copy compatible weights (focus on CNN/LSTM parts)
-print("\n🔄 Attempting weight transfer from baseline...")
-copied = 0
-for target_layer in model.layers:
-    try:
-        if target_layer.name in [l.name for l in baseline_loaded.layers]:
-            source_layer = [l for l in baseline_loaded.layers if l.name == target_layer.name][0]
-            if len(source_layer.get_weights()) == len(target_layer.get_weights()):
-                target_layer.set_weights(source_layer.get_weights())
+copied, skipped = 0, 0
+for layer in mha_model.layers:
+    if layer.name in loaded_map:
+        src = loaded_map[layer.name]
+        try:
+            sw, tw = src.get_weights(), layer.get_weights()
+            if len(sw) == len(tw) and all(a.shape == b.shape for a, b in zip(sw, tw)):
+                layer.set_weights(sw)
                 copied += 1
-    except:
-        continue
+            else:
+                skipped += 1
+        except Exception:
+            skipped += 1
 
-print(f"✅ Transferred {copied} layers from baseline")
+print(f"✅ Warm-start complete. Copied: {copied}, Skipped: {skipped}")
+mha_model.summary()
 
 # -----------------------------
-# Advanced Training Strategy
+# Fresh callbacks per phase (avoid state leakage)
 # -----------------------------
-# Phase 1: Train only attention and new layers
-new_layers = ["multi_head_attention", "attention_skip", "post_attention_norm", 
-              "global_avg_pool", "global_max_pool", "context_concat",
-              "time_attention_dense", "attention_flatten", "time_attention_weights",
-              "apply_time_attention", "temporal_context", "final_concat"]
+def make_callbacks():
+    return [
+        tf.keras.callbacks.ModelCheckpoint(OUT_CKPT, monitor="val_loss", save_best_only=True),
+        tf.keras.callbacks.ReduceLROnPlateau(monitor="val_loss", patience=5, factor=0.5, min_lr=1e-5),
+        tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=12, restore_best_weights=True),
+        tf.keras.callbacks.TerminateOnNaN(),
+    ]
 
-for layer in model.layers:
-    layer.trainable = layer.name in new_layers
+# -----------------------------
+# Phase 1: Train only new layers
+# -----------------------------
+TRAINABLE_NEW = {
+    "attn_ln", "mha", "attn_residual", "attn_post_ln",
+    "attn_pool", "ctx_proj",
+    "gate_concat", "gate", "gated_ctx", "fused_last_plus_mha",
+}
 
-model.compile(
+for layer in mha_model.layers:
+    layer.trainable = (layer.name in TRAINABLE_NEW)
+
+mha_model.compile(
     optimizer=tf.keras.optimizers.Adam(LR_PHASE1, clipnorm=1.0),
-    loss="mse",
-    metrics=[tf.keras.metrics.RootMeanSquaredError(name="rmse")]
+    loss="mse"
 )
 
-# Custom learning rate scheduler
-def lr_schedule(epoch, lr):
-    if epoch < 10:
-        return 1e-3
-    elif epoch < 25:
-        return 5e-4
-    else:
-        return 2e-4
-
-callbacks = [
-    tf.keras.callbacks.ModelCheckpoint(
-        OUT_CKPT,
-        monitor="val_loss",
-        save_best_only=True,
-        save_weights_only=False
-    ),
-    tf.keras.callbacks.ReduceLROnPlateau(
-        monitor="val_loss",
-        factor=0.5,
-        patience=6,
-        min_lr=1e-6,
-        verbose=1
-    ),
-    tf.keras.callbacks.EarlyStopping(
-        monitor="val_loss",
-        patience=15,
-        restore_best_weights=True,
-        verbose=1
-    ),
-    tf.keras.callbacks.LearningRateScheduler(lr_schedule),
-    tf.keras.callbacks.TensorBoard(log_dir="./logs_enhanced", update_freq="batch"),
-]
-
-print("\n🧊 Phase 1: Training attention mechanisms and new layers")
-history1 = model.fit(
+print("\n🧊 Phase 1: training ONLY MHA/gate/projection (backbone frozen)")
+mha_model.fit(
     X_train, y_train,
     validation_data=(X_val, y_val),
     epochs=EPOCHS_PHASE1,
     batch_size=BATCH_SIZE,
-    callbacks=callbacks,
+    callbacks=make_callbacks(),
     verbose=1
 )
 
+# -----------------------------
 # Phase 2: Fine-tune all layers
-for layer in model.layers:
+# -----------------------------
+for layer in mha_model.layers:
     layer.trainable = True
 
-model.compile(
+mha_model.compile(
     optimizer=tf.keras.optimizers.Adam(LR_PHASE2, clipnorm=1.0),
-    loss="mse",
-    metrics=[tf.keras.metrics.RootMeanSquaredError(name="rmse")]
+    loss="mse"
 )
 
-print("\n🔥 Phase 2: Fine-tuning all layers")
-history2 = model.fit(
+print("\n🔥 Phase 2: fine-tuning ALL layers (small LR)")
+mha_model.fit(
     X_train, y_train,
     validation_data=(X_val, y_val),
     epochs=EPOCHS_PHASE2,
     batch_size=BATCH_SIZE,
-    callbacks=callbacks,
+    callbacks=make_callbacks(),
     verbose=1
 )
 
 # -----------------------------
-# Evaluation
+# Test evaluation
 # -----------------------------
-y_pred = model.predict(X_test, verbose=0).ravel()
+y_pred = mha_model.predict(X_test, verbose=0).ravel()
 
-# Scaled metrics
 mse_scaled = mean_squared_error(y_test, y_pred)
 rmse_scaled = float(np.sqrt(mse_scaled))
 mae_scaled = mean_absolute_error(y_test, y_pred)
@@ -261,14 +331,11 @@ y_test_log = inverse_minmax(y_test)
 y_pred_log = inverse_minmax(y_pred)
 y_test_bytes = log1p_to_bytes(y_test_log)
 y_pred_bytes = log1p_to_bytes(y_pred_log)
-
 mse_bytes = mean_squared_error(y_test_bytes, y_pred_bytes)
 rmse_bytes = float(np.sqrt(mse_bytes))
 mae_bytes = mean_absolute_error(y_test_bytes, y_pred_bytes)
 
-print("\n" + "="*60)
-print("📊 ENHANCED ATTENTION TEST RESULTS")
-print("="*60)
+print("\n📊 TEST RESULTS (Warm-start Baseline + MHA, gated)")
 print(f"R² (scaled target)  : {r2:.4f}")
 print(f"MSE (scaled target) : {mse_scaled:.6f}")
 print(f"RMSE (scaled target): {rmse_scaled:.4f}")
@@ -277,117 +344,77 @@ print(f"MAE (bytes)         : {mae_bytes:.2f}")
 print(f"RMSE (bytes)        : {rmse_bytes:.2f}")
 
 # -----------------------------
-# Comparative Analysis
+# Attention logs (after training, on fixed probe batch)
 # -----------------------------
-# Load baseline predictions for comparison
-baseline_model = tf.keras.models.load_model(BASELINE_CKPT, compile=False)
-y_pred_baseline = baseline_model.predict(X_test, verbose=0).ravel()
-r2_baseline = r2_score(y_test, y_pred_baseline)
-
-print("\n" + "="*60)
-print("📈 IMPROVEMENT ANALYSIS")
-print("="*60)
-print(f"Baseline R²        : {r2_baseline:.4f}")
-print(f"Enhanced R²        : {r2:.4f}")
-print(f"Absolute Improvement: {r2 - r2_baseline:.4f}")
-print(f"Relative Improvement: {((r2 - r2_baseline) / r2_baseline * 100):.1f}%")
+X_probe = X_val[:256].astype(np.float32)
+log_mha_attention(mha_model, X_probe, freq_ms=FREQ_MS, pool_factor=POOL_FACTOR)
 
 # -----------------------------
-# Attention Visualization
+# Forecast (clip only here)
 # -----------------------------
-# Extract attention weights for visualization
-attention_layer = model.get_layer("multi_head_attention")
-attention_model = tf.keras.Model(
-    inputs=model.input,
-    outputs=[attention_layer.output, model.output]
+def forecast_future(model, last_window, steps=20, clip_range=(0.0, 1.0)):
+    current = last_window.copy()
+    out = []
+
+    lag_hist = []
+    if lag_idxs:
+        for idx in lag_idxs:
+            lag_hist.append(float(current[-1, idx]))
+
+    for _ in range(steps):
+        pred = float(model.predict(current[np.newaxis], verbose=0)[0, 0])
+        pred = float(np.clip(pred, clip_range[0], clip_range[1]))
+        out.append(pred)
+
+        current[:-1] = current[1:]
+        new_row = current[-2].copy()
+
+        if target_idx is not None:
+            new_row[target_idx] = pred
+
+        if lag_idxs:
+            new_row[lag_idxs[0]] = pred
+            for j in range(1, len(lag_idxs)):
+                new_row[lag_idxs[j]] = lag_hist[j-1] if lag_hist else new_row[lag_idxs[j-1]]
+            lag_hist = [pred] + (lag_hist[:-1] if lag_hist else [pred]*(len(lag_idxs)-1))
+
+        current[-1] = new_row
+
+    return np.array(out, dtype=np.float32)
+
+PLOT_LEN = min(300, len(y_test))
+start_idx = PLOT_LEN - 1
+forecast_scaled = forecast_future(mha_model, X_test[start_idx], steps=FORECAST_HORIZON, clip_range=CLIP_RANGE)
+
+print("\n🔎 Forecast sanity check")
+print("forecast head:", forecast_scaled[:5])
+print("forecast std :", float(np.std(forecast_scaled)))
+
+# -----------------------------
+# Plot
+# -----------------------------
+plt.figure(figsize=(14, 5))
+plt.plot(y_test[:PLOT_LEN], label="Actual (past)", linewidth=2)
+plt.plot(y_pred[:PLOT_LEN], "--", label="Predicted (past)", linewidth=2)
+
+forecast_start = PLOT_LEN
+plt.plot(
+    range(forecast_start, forecast_start + FORECAST_HORIZON),
+    forecast_scaled,
+    "r-o",
+    label="Forecast (future)",
+    markersize=3
 )
+plt.axvline(forecast_start, linestyle=":", color="black", alpha=0.7, label="Forecast start")
 
-sample_input = X_test[:1]
-attention_output, _ = attention_model.predict(sample_input, verbose=0)
-
-# Visualize attention weights
-plt.figure(figsize=(15, 10))
-
-# Plot 1: Performance comparison
-plt.subplot(2, 2, 1)
-plt.plot(y_test[:100], label="Actual", alpha=0.7)
-plt.plot(y_pred_baseline[:100], '--', label=f"Baseline (R²={r2_baseline:.3f})", alpha=0.7)
-plt.plot(y_pred[:100], ':', label=f"Enhanced (R²={r2:.3f})", alpha=0.7, linewidth=2)
-plt.title("Predictions Comparison (First 100 samples)")
-plt.xlabel("Time windows")
-plt.ylabel("Scaled Target")
+plt.title(f"Baseline + MHA | R²={r2:.3f} (scaled)", fontsize=14)
+plt.xlabel("Time windows (250ms)")
+plt.ylabel("Target (scaled)")
 plt.legend()
 plt.grid(alpha=0.3)
-
-# Plot 2: Residuals comparison
-plt.subplot(2, 2, 2)
-residuals_baseline = y_test - y_pred_baseline
-residuals_enhanced = y_test - y_pred
-plt.hist(residuals_baseline, bins=50, alpha=0.5, label=f"Baseline (σ={np.std(residuals_baseline):.3f})")
-plt.hist(residuals_enhanced, bins=50, alpha=0.5, label=f"Enhanced (σ={np.std(residuals_enhanced):.3f})")
-plt.title("Residual Distribution")
-plt.xlabel("Prediction Error")
-plt.ylabel("Frequency")
-plt.legend()
-plt.grid(alpha=0.3)
-
-# Plot 3: Scatter plot
-plt.subplot(2, 2, 3)
-plt.scatter(y_test, y_pred_baseline, alpha=0.3, s=10, label="Baseline")
-plt.scatter(y_test, y_pred, alpha=0.3, s=10, label="Enhanced")
-plt.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'k--', label="Perfect")
-plt.title("Predictions vs Actual")
-plt.xlabel("Actual (scaled)")
-plt.ylabel("Predicted (scaled)")
-plt.legend()
-plt.grid(alpha=0.3)
-
-# Plot 4: Attention weights visualization
-plt.subplot(2, 2, 4)
-if attention_output.ndim == 3:
-    # Average across heads
-    attention_weights = np.mean(np.abs(attention_output[0]), axis=-1)
-    plt.imshow(attention_weights.T, aspect='auto', cmap='viridis')
-    plt.colorbar(label='Attention Weight')
-    plt.title("Attention Weights (averaged across heads)")
-    plt.xlabel("Time Step")
-    plt.ylabel("Feature Dimension")
-else:
-    plt.text(0.5, 0.5, "Attention visualization\nrequires 3D output", 
-             ha='center', va='center', transform=plt.gca().transAxes)
-
 plt.tight_layout()
-plt.savefig(PLOT_FILE, dpi=150, bbox_inches='tight')
+plt.savefig(PLOT_FILE, dpi=140)
 plt.show()
 
-# -----------------------------
-# Statistical Significance Test
-# -----------------------------
-from scipy import stats
-
-# Paired t-test for residuals
-t_stat, p_value = stats.ttest_rel(np.abs(residuals_baseline), np.abs(residuals_enhanced))
-
-print("\n" + "="*60)
-print("🔬 STATISTICAL SIGNIFICANCE TEST")
-print("="*60)
-print(f"Paired t-test p-value: {p_value:.6f}")
-if p_value < 0.05:
-    print("✅ Statistically significant improvement (p < 0.05)")
-else:
-    print("⚠️  Improvement not statistically significant")
-
-# Save final model
-model.save(OUT_CKPT)
-print(f"\n✅ Saved enhanced model to {OUT_CKPT}")
-print(f"✅ Saved comprehensive plot to {PLOT_FILE}")
-
-# Print summary
-print("\n" + "="*60)
-print("🎯 SUMMARY")
-print("="*60)
-print(f"1. Baseline R²: {r2_baseline:.4f}")
-print(f"2. Enhanced R²: {r2:.4f}")
-print(f"3. Improvement: {r2 - r2_baseline:.4f} ({(r2/r2_baseline-1)*100:.1f}%)")
-print(f"4. MAE Reduction: {mean_absolute_error(y_test, y_pred_baseline) - mae_scaled:.4f}")
-print(f"5. Statistical significance: {'Yes' if p_value < 0.05 else 'No'} (p={p_value:.4f})")
+print(f"\n✅ Saved plot to {PLOT_FILE}")
+print(f"✅ Saved best model to {OUT_CKPT}")
