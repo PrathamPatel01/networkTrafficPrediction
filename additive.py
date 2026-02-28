@@ -1,7 +1,4 @@
-# train_baseline_plus_additive_warmstart.py
-# ✅ Baseline + Additive Attention (warm-start from .keras baseline checkpoint)
-# ✅ Works with Keras .keras format (no by_name load)
-# ✅ Attention is gated so it can only provide a small correction (helps prove attention helps)
+
 
 import os, random
 import numpy as np
