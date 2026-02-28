@@ -1,16 +1,4 @@
-# analyze_attention_and_forecast.py
-# ------------------------------------------------------------
-# Loads a trained additive-attention model and dataset.npz
-# Prints:
-#   - [ATTN QUICK LOG] (where attention looks: recent vs memory)
-#   - 🔎 Forecast sanity check (forecast head + std)
-#
-# Usage:
-#   python analyze_attention_and_forecast.py \
-#       --model best_baseline_additive_warmstart.keras \
-#       --data data/dataset.npz \
-#       --freq_ms 250 --pool_factor 2 --probe_n 256 --forecast_horizon 20
-# ------------------------------------------------------------
+
 
 import argparse
 import numpy as np
